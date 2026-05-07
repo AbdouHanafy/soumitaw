@@ -1,7 +1,5 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 CREATE TABLE IF NOT EXISTS products (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     category VARCHAR(100),
     unit VARCHAR(50),
@@ -10,7 +8,7 @@ CREATE TABLE IF NOT EXISTS products (
 );
 
 CREATE TABLE IF NOT EXISTS merchants (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     type VARCHAR(50),
     address TEXT,
@@ -23,7 +21,7 @@ CREATE TABLE IF NOT EXISTS merchants (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     email VARCHAR(255) UNIQUE,
     phone VARCHAR(20),
     role VARCHAR(20) DEFAULT 'citizen',
@@ -33,7 +31,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS prices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     product_id UUID NOT NULL REFERENCES products(id),
     merchant_id UUID REFERENCES merchants(id),
     price DECIMAL(10, 3) NOT NULL,
@@ -52,7 +50,7 @@ CREATE TABLE IF NOT EXISTS prices (
 );
 
 CREATE TABLE IF NOT EXISTS price_alerts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY,
     user_id UUID REFERENCES users(id),
     product_id UUID REFERENCES products(id),
     target_price DECIMAL(10, 3),
@@ -61,4 +59,3 @@ CREATE TABLE IF NOT EXISTS price_alerts (
     active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT NOW()
 );
-
