@@ -1,0 +1,210 @@
+name: SoumiTaw Azure Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME || 'acrcloudshopabdou' }}
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'rg-cloudshop-dev' }}
+  BACKEND_APP_NAME: ${{ vars.BACKEND_APP_NAME || 'ca-backend' }}
+  FRONTEND_APP_NAME: ${{ vars.FRONTEND_APP_NAME || 'ca-frontend' }}
+  POSTGRES_SERVER_NAME: ${{ vars.POSTGRES_SERVER_NAME || 'psql-cloudshop-dev-frc' }}
+  POSTGRES_ADMIN_USERNAME: ${{ vars.POSTGRES_ADMIN_USERNAME || 'cloudshopadmin' }}
+  DATABASE_NAME: ${{ vars.DATABASE_NAME || 'soumitaw' }}
+
+jobs:
+  validate:
+    name: Validate Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Check backend syntax
+        run: python -m compileall backend/app
+
+      - name: Install frontend dependencies
+        run: npm install
+        working-directory: frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: http://localhost:8000
+
+      - name: Build backend production image
+        run: docker build -f backend/Dockerfile.prod -t soumitaw-backend:test backend
+
+      - name: Build frontend production image
+        run: docker build -f frontend/Dockerfile.prod --build-arg VITE_API_BASE_URL=http://localhost:8000 -t soumitaw-frontend:test frontend
+
+  deploy-backend:
+    name: Deploy Backend To Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    outputs:
+      backend_url: ${{ steps.discover.outputs.backend_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          for value in AZURE_CREDENTIALS POSTGRES_ADMIN_PASSWORD; do
+            if [ -z "${!value}" ]; then
+              echo "::error::$value is required for deployment"
+              exit 1
+            fi
+          done
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Ensure application database exists
+        run: |
+          az postgres flexible-server db create \
+            --resource-group "$RESOURCE_GROUP" \
+            --server-name "$POSTGRES_SERVER_NAME" \
+            --database-name "$DATABASE_NAME"
+
+      - name: Resolve PostgreSQL host
+        id: pg
+        run: |
+          echo "postgres_host=$(az postgres flexible-server show --resource-group "$RESOURCE_GROUP" --name "$POSTGRES_SERVER_NAME" --query fullyQualifiedDomainName -o tsv)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend image
+        run: |
+          docker build \
+            -f backend/Dockerfile.prod \
+            -t $ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }} \
+            -t $ACR_NAME.azurecr.io/soumitaw-backend:latest \
+            backend
+
+          docker push $ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }}
+          docker push $ACR_NAME.azurecr.io/soumitaw-backend:latest
+
+      - name: Store backend secret
+        env:
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          DATABASE_URL="postgresql://${POSTGRES_ADMIN_USERNAME}:${POSTGRES_ADMIN_PASSWORD}@${{ steps.pg.outputs.postgres_host }}/${DATABASE_NAME}?sslmode=require"
+          az containerapp secret set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --secrets database-url="$DATABASE_URL"
+
+      - name: Deploy backend
+        run: |
+          az containerapp update \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }}" \
+            --set-env-vars \
+              DATABASE_URL=secretref:database-url \
+              CORS_ORIGINS=https://placeholder.local \
+              ENVIRONMENT=production
+
+      - name: Discover backend URL
+        id: discover
+        run: |
+          echo "backend_url=https://$(az containerapp show --name "$BACKEND_APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)" >> "$GITHUB_OUTPUT"
+
+  deploy-frontend:
+    name: Deploy Frontend To Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    outputs:
+      frontend_url: ${{ steps.discover.outputs.frontend_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build and push frontend image
+        run: |
+          docker build \
+            -f frontend/Dockerfile.prod \
+            --build-arg VITE_API_BASE_URL=${{ needs.deploy-backend.outputs.backend_url }} \
+            -t $ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }} \
+            -t $ACR_NAME.azurecr.io/soumitaw-frontend:latest \
+            frontend
+
+          docker push $ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }}
+          docker push $ACR_NAME.azurecr.io/soumitaw-frontend:latest
+
+      - name: Deploy frontend
+        run: |
+          az containerapp update \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }}"
+
+      - name: Discover frontend URL
+        id: discover
+        run: |
+          echo "frontend_url=https://$(az containerapp show --name "$FRONTEND_APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)" >> "$GITHUB_OUTPUT"
+
+  finalize:
+    name: Finalize CORS
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set backend frontend origin
+        run: |
+          az containerapp update \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --set-env-vars \
+              DATABASE_URL=secretref:database-url \
+              CORS_ORIGINS=${{ needs.deploy-frontend.outputs.frontend_url }} \
+              ENVIRONMENT=production
+
