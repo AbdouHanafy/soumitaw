@@ -4,13 +4,25 @@ This repo includes a deployment workflow in [.github/workflows/deploy.yml](./.gi
 
 ## Required GitHub secret
 
-- `AZURE_CREDENTIALS`
 - `POSTGRES_ADMIN_PASSWORD`
+
+## Azure authentication
+
+Use one of these two options:
+
+1. `AZURE_CREDENTIALS` secret
+2. GitHub OIDC with:
+   - `AZURE_CLIENT_ID`
+   - `AZURE_TENANT_ID`
+   - `AZURE_SUBSCRIPTION_ID`
+
+You can store the OIDC values as repository variables or secrets.
 
 ## Required or recommended GitHub variables
 
 - `ACR_NAME`
 - `RESOURCE_GROUP`
+- `CONTAINER_APP_ENVIRONMENT`
 - `BACKEND_APP_NAME`
 - `FRONTEND_APP_NAME`
 - `POSTGRES_SERVER_NAME`
@@ -21,6 +33,7 @@ This repo includes a deployment workflow in [.github/workflows/deploy.yml](./.gi
 
 - `ACR_NAME=acrcloudshopabdou`
 - `RESOURCE_GROUP=rg-cloudshop-dev`
+- `CONTAINER_APP_ENVIRONMENT=cae-cloudshop-dev`
 - `BACKEND_APP_NAME=ca-backend`
 - `FRONTEND_APP_NAME=ca-frontend`
 - `POSTGRES_SERVER_NAME=psql-cloudshop-dev-frc`
@@ -42,13 +55,21 @@ Example shape:
 }
 ```
 
+## Azure OIDC alternative
+
+If you do not want to use `AZURE_CREDENTIALS`, configure a federated credential on your Azure app registration for this GitHub repository and set:
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
+
 ## What the pipeline does
 
 1. validates backend and frontend
 2. builds production Docker images
 3. pushes images to ACR
-4. updates `ca-backend`
+4. creates or updates `ca-backend`
 5. discovers backend URL
 6. rebuilds frontend with the backend URL injected
-7. updates `ca-frontend`
+7. creates or updates `ca-frontend`
 8. patches backend `CORS_ORIGINS` with the deployed frontend URL

@@ -14,11 +14,15 @@ permissions:
 env:
   ACR_NAME: ${{ vars.ACR_NAME || 'acrcloudshopabdou' }}
   RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'rg-cloudshop-dev' }}
+  CONTAINER_APP_ENVIRONMENT: ${{ vars.CONTAINER_APP_ENVIRONMENT || 'cae-cloudshop-dev' }}
   BACKEND_APP_NAME: ${{ vars.BACKEND_APP_NAME || 'ca-backend' }}
   FRONTEND_APP_NAME: ${{ vars.FRONTEND_APP_NAME || 'ca-frontend' }}
   POSTGRES_SERVER_NAME: ${{ vars.POSTGRES_SERVER_NAME || 'psql-cloudshop-dev-frc' }}
   POSTGRES_ADMIN_USERNAME: ${{ vars.POSTGRES_ADMIN_USERNAME || 'cloudshopadmin' }}
   DATABASE_NAME: ${{ vars.DATABASE_NAME || 'soumitaw' }}
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
 
 jobs:
   validate:
@@ -78,20 +82,43 @@ jobs:
           AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
           POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
         run: |
-          for value in AZURE_CREDENTIALS POSTGRES_ADMIN_PASSWORD; do
-            if [ -z "${!value}" ]; then
-              echo "::error::$value is required for deployment"
-              exit 1
-            fi
-          done
+          if [ -z "$POSTGRES_ADMIN_PASSWORD" ]; then
+            echo "::error::POSTGRES_ADMIN_PASSWORD is required for deployment"
+            exit 1
+          fi
 
-      - name: Login to Azure
+          if [ -n "$AZURE_CREDENTIALS" ]; then
+            exit 0
+          fi
+
+          if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_SUBSCRIPTION_ID" ]; then
+            echo "::error::Set AZURE_CREDENTIALS or configure AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_SUBSCRIPTION_ID for OIDC login"
+            exit 1
+          fi
+
+      - name: Login to Azure with service principal secret
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Login to Azure with OIDC
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
       - name: Login to ACR
         run: az acr login --name "$ACR_NAME"
+
+      - name: Resolve ACR credentials
+        id: acr
+        run: |
+          echo "login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)" >> "$GITHUB_OUTPUT"
+          echo "username=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)" >> "$GITHUB_OUTPUT"
+          echo "password=$(az acr credential show --name "$ACR_NAME" --query passwords[0].value -o tsv)" >> "$GITHUB_OUTPUT"
 
       - name: Ensure application database exists
         run: |
@@ -105,37 +132,66 @@ jobs:
         run: |
           echo "postgres_host=$(az postgres flexible-server show --resource-group "$RESOURCE_GROUP" --name "$POSTGRES_SERVER_NAME" --query fullyQualifiedDomainName -o tsv)" >> "$GITHUB_OUTPUT"
 
+      - name: Build database URL
+        id: db
+        env:
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          echo "database_url=postgresql://${POSTGRES_ADMIN_USERNAME}:${POSTGRES_ADMIN_PASSWORD}@${{ steps.pg.outputs.postgres_host }}/${DATABASE_NAME}?sslmode=require" >> "$GITHUB_OUTPUT"
+
       - name: Build and push backend image
         run: |
           docker build \
             -f backend/Dockerfile.prod \
-            -t $ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }} \
-            -t $ACR_NAME.azurecr.io/soumitaw-backend:latest \
+            -t ${{ steps.acr.outputs.login_server }}/soumitaw-backend:${{ github.sha }} \
+            -t ${{ steps.acr.outputs.login_server }}/soumitaw-backend:latest \
             backend
 
-          docker push $ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }}
-          docker push $ACR_NAME.azurecr.io/soumitaw-backend:latest
+          docker push ${{ steps.acr.outputs.login_server }}/soumitaw-backend:${{ github.sha }}
+          docker push ${{ steps.acr.outputs.login_server }}/soumitaw-backend:latest
 
       - name: Store backend secret
-        env:
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
         run: |
-          DATABASE_URL="postgresql://${POSTGRES_ADMIN_USERNAME}:${POSTGRES_ADMIN_PASSWORD}@${{ steps.pg.outputs.postgres_host }}/${DATABASE_NAME}?sslmode=require"
           az containerapp secret set \
             --name "$BACKEND_APP_NAME" \
             --resource-group "$RESOURCE_GROUP" \
-            --secrets database-url="$DATABASE_URL"
+            --secrets database-url="${{ steps.db.outputs.database_url }}"
 
       - name: Deploy backend
         run: |
-          az containerapp update \
-            --name "$BACKEND_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$ACR_NAME.azurecr.io/soumitaw-backend:${{ github.sha }}" \
-            --set-env-vars \
-              DATABASE_URL=secretref:database-url \
-              CORS_ORIGINS=https://placeholder.local \
-              ENVIRONMENT=production
+          if az containerapp show --name "$BACKEND_APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp registry set \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "${{ steps.acr.outputs.login_server }}" \
+              --username "${{ steps.acr.outputs.username }}" \
+              --password "${{ steps.acr.outputs.password }}"
+
+            az containerapp update \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "${{ steps.acr.outputs.login_server }}/soumitaw-backend:${{ github.sha }}" \
+              --set-env-vars \
+                DATABASE_URL=secretref:database-url \
+                CORS_ORIGINS=https://placeholder.local \
+                ENVIRONMENT=production
+          else
+            az containerapp create \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINER_APP_ENVIRONMENT" \
+              --image "${{ steps.acr.outputs.login_server }}/soumitaw-backend:${{ github.sha }}" \
+              --ingress external \
+              --target-port 8000 \
+              --registry-server "${{ steps.acr.outputs.login_server }}" \
+              --registry-username "${{ steps.acr.outputs.username }}" \
+              --registry-password "${{ steps.acr.outputs.password }}" \
+              --secrets database-url="${{ steps.db.outputs.database_url }}" \
+              --env-vars \
+                DATABASE_URL=secretref:database-url \
+                CORS_ORIGINS=https://placeholder.local \
+                ENVIRONMENT=production
+          fi
 
       - name: Discover backend URL
         id: discover
@@ -154,32 +210,68 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Login to Azure
+      - name: Login to Azure with service principal secret
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Login to Azure with OIDC
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
       - name: Login to ACR
         run: az acr login --name "$ACR_NAME"
+
+      - name: Resolve ACR credentials
+        id: acr
+        run: |
+          echo "login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)" >> "$GITHUB_OUTPUT"
+          echo "username=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)" >> "$GITHUB_OUTPUT"
+          echo "password=$(az acr credential show --name "$ACR_NAME" --query passwords[0].value -o tsv)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push frontend image
         run: |
           docker build \
             -f frontend/Dockerfile.prod \
             --build-arg VITE_API_BASE_URL=${{ needs.deploy-backend.outputs.backend_url }} \
-            -t $ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }} \
-            -t $ACR_NAME.azurecr.io/soumitaw-frontend:latest \
+            -t ${{ steps.acr.outputs.login_server }}/soumitaw-frontend:${{ github.sha }} \
+            -t ${{ steps.acr.outputs.login_server }}/soumitaw-frontend:latest \
             frontend
 
-          docker push $ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }}
-          docker push $ACR_NAME.azurecr.io/soumitaw-frontend:latest
+          docker push ${{ steps.acr.outputs.login_server }}/soumitaw-frontend:${{ github.sha }}
+          docker push ${{ steps.acr.outputs.login_server }}/soumitaw-frontend:latest
 
       - name: Deploy frontend
         run: |
-          az containerapp update \
-            --name "$FRONTEND_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$ACR_NAME.azurecr.io/soumitaw-frontend:${{ github.sha }}"
+          if az containerapp show --name "$FRONTEND_APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp registry set \
+              --name "$FRONTEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "${{ steps.acr.outputs.login_server }}" \
+              --username "${{ steps.acr.outputs.username }}" \
+              --password "${{ steps.acr.outputs.password }}"
+
+            az containerapp update \
+              --name "$FRONTEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "${{ steps.acr.outputs.login_server }}/soumitaw-frontend:${{ github.sha }}"
+          else
+            az containerapp create \
+              --name "$FRONTEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINER_APP_ENVIRONMENT" \
+              --image "${{ steps.acr.outputs.login_server }}/soumitaw-frontend:${{ github.sha }}" \
+              --ingress external \
+              --target-port 8080 \
+              --registry-server "${{ steps.acr.outputs.login_server }}" \
+              --registry-username "${{ steps.acr.outputs.username }}" \
+              --registry-password "${{ steps.acr.outputs.password }}"
+          fi
 
       - name: Discover frontend URL
         id: discover
@@ -193,10 +285,19 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Login to Azure
+      - name: Login to Azure with service principal secret
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure with OIDC
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Set backend frontend origin
         run: |
@@ -207,4 +308,3 @@ jobs:
               DATABASE_URL=secretref:database-url \
               CORS_ORIGINS=${{ needs.deploy-frontend.outputs.frontend_url }} \
               ENVIRONMENT=production
-
